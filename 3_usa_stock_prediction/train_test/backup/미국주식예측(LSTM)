@@ -1,0 +1,745 @@
+# https://www.thepythoncode.com/article/stock-price-prediction-in-python-using-tensorflow-2-and-keras
+
+
+#===============================================================================================#
+# >>>>> 0. 기본설정 : Env 초기화, import Modules, Path 지정 ----
+#===============================================================================================#
+
+# # 최신버전 확인
+# pip install --upgrade pip
+# pip upgrade --check
+
+# # Env 초기화
+# import sys
+# sys.modules[__name__].__dict__.clear()
+# locals()['_oh'] = {}
+
+# pip install tensorflow pandas numpy matplotlib yahoo_fin sklearn
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
+from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
+
+from sklearn import preprocessing
+from sklearn.model_selection import train_test_split
+
+from yahoo_fin import stock_info as si
+from collections import deque
+
+import os
+import numpy as np
+import pandas as pd
+import random
+import time
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+# plt.style.use('ggplot')
+mpl.rcParams['figure.dpi'] = 500 # 해상도 조정
+
+import shutil
+
+import datetime
+from tqdm import tqdm
+
+# pip install plotnine
+from plotnine import *
+from plydata import *
+
+# Path 지정
+os.chdir("F:/USB포맷_210223/STUDY/주식예측")
+# os.getcwd()
+
+# Create these folders (if they does not exist)
+if not os.path.isdir("RES"): os.mkdir("RES")
+if not os.path.isdir("LOG"): os.mkdir("LOG")
+if not os.path.isdir("DAT"): os.mkdir("DAT")
+
+%load_ext tensorboard
+
+#-----------------------------------------------------------------------------------------------#
+# 0.0. initial value ----
+#-----------------------------------------------------------------------------------------------#
+
+#-----------------------------------------------------------------------------------------------#
+# 0.0.1. set seed
+#-----------------------------------------------------------------------------------------------#
+SEED_NUM = 777
+
+np.random.seed(SEED_NUM)
+tf.random.set_seed(SEED_NUM)
+random.seed(SEED_NUM)
+
+#-----------------------------------------------------------------------------------------------#
+# 0.0.1. Data step parameter
+#-----------------------------------------------------------------------------------------------#
+# date now
+DATE_NOW = time.strftime("%Y-%m-%d")
+
+# ticker and file path
+TICKER = "AAPL"
+ticker_data_filename = os.path.join("DAT", f"{TICKER}_{DATE_NOW}.csv")
+
+# date
+START_DATE, END_DATE = '2016-01-01','2021-09-30' # None, None
+
+# N_STEPS     : Window size or the sequence length
+# LOOKUP_STEP : 1 is the next day
+N_STEPS, LOOKUP_STEP = 50, 15
+
+# whether to scale feature columns & output price as well
+SCALE = True
+scale_str = f"sc-{int(SCALE)}"
+
+# whether to shuffle the dataset
+SHUFFLE = True
+shuffle_str = f"sh-{int(SHUFFLE)}"
+
+# whether to split the training/testing set by date
+SPLIT_BY_DATE = True
+split_by_date_str = f"sbd-{int(SPLIT_BY_DATE)}"
+
+NEW_FEATURE = True
+
+# test ratio size
+TEST_SIZE = 0.2
+
+# features to use
+FEATURE_COLUMNS = ["adjclose", "volume", "open", "high", "low"]
+
+#-----------------------------------------------------------------------------------------------#
+# 0.0.2. Model step parameter
+#-----------------------------------------------------------------------------------------------#
+CELL          = LSTM  # LSTM Model
+N_LAYERS      = 4-1   # LSTM cell
+UNITS         = 256   # 256 LSTM neurons
+DROPOUT       = 0.4   # 40% dropout
+BIDIRECTIONAL = False # whether to use bidirectional RNNs
+
+#------------------------------------------------------------------#
+# 0.0.3. Training step parameters
+#------------------------------------------------------------------#
+LOSS       = ["huber_loss","mae"][0]
+OPTIMIZER  = "adam"
+BATCH_SIZE = 64                # The number of data samples to use on each training iteration.
+EPOCHS     = [100,500,1000][1] # The number of times that the learning algorithm will pass through the entire training dataset
+
+# model name to save, making it as unique as possible based on parameters
+model_name = f"{DATE_NOW}_{TICKER}-{START_DATE}-{END_DATE}-{EPOCHS}-{shuffle_str}-{scale_str}-{split_by_date_str}-\
+{LOSS}-{OPTIMIZER}-{CELL.__name__}-seq-{N_STEPS}-step-{LOOKUP_STEP}-layers-{N_LAYERS}-units-{UNITS}"
+if BIDIRECTIONAL: model_name += "-b"
+
+
+#-----------------------------------------------------------------------------------------------#
+# 0.1. user defined function
+#-----------------------------------------------------------------------------------------------#
+# 0.1.1. rpy2
+# conda install -c r r-essentials --yes
+def edit(df):
+
+    import rpy2
+    from rpy2 import robjects as ro
+    from rpy2.robjects import r
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+    from rpy2.robjects import globalenv
+    
+    with localconverter(ro.default_converter + pandas2ri.converter):
+         r_df = rpy2.robjects.conversion.py2rpy(df)
+         
+    globalenv['r_df'] = r_df
+    
+    r('edit(r_df)')
+
+# 0.1.2. Max Output Display
+def View(data, row = True, col = True):
+    # data, row, col = df, False, True
+    if row: pd.set_option('display.max_rows', 500) 
+    if col: pd.set_option('display.max_columns', 500)
+    pd.set_option('display.width', 1000)
+    
+    print(data)
+
+    pd.set_option('display.max_rows', 0)
+    pd.set_option('display.max_columns', 0)
+    pd.set_option('display.width', 0)
+
+# 0.1.3. New Feature function
+def new_feature_fn(df,
+                   price_column = 'adjclose', ticker_column = 'ticker', volume_column = 'volume',
+                   macd_short=12, macd_long=26, macd_signal=9,
+                   date_remove = True,
+                   feature_columns = None):
+
+    # df = si.get_data('AAPL', '20210801','20210901')
+    # price_column, ticker_column, volume_column = 'adjclose', 'ticker', 'volume'
+    # macd_short, macd_long, macd_signal = 12, 26, 9
+    # date_remove   = True
+    # feature_columns = ['adjclose', 'volume', 'open', 'high', 'low']
+    
+    raw_df = df.copy()
+    
+    # 2.1. Moving Average for Close price : 5,10,20,60,120
+    df['MA5'  ] = df[price_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(5).mean())
+    df['MA10' ] = df[price_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(10).mean())
+    df['MA20' ] = df[price_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(20).mean())
+    df['MA60' ] = df[price_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(60).mean())
+    df['MA120'] = df[price_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(120).mean())
+    
+    # 2.2. Moving Average for Volume : 5,10,20,60,120
+    df[volume_column + '.MA5'  ] = df[volume_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(5).mean())
+    df[volume_column + '.MA10' ] = df[volume_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(10).mean())
+    df[volume_column + '.MA20' ] = df[volume_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(20).mean())
+    df[volume_column + '.MA60' ] = df[volume_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(60).mean())
+    df[volume_column + '.MA120'] = df[volume_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(120).mean())
+    
+    # 2.3. weekday, month
+    df['weekday'] = df.index.dayofweek + 1 # 월요일을 1로
+
+    # 2.4. 볼린저밴드
+    df['stddev'] = df[price_column].groupby(df[ticker_column]).apply(lambda x: x.rolling(20).std()) # 20일 이동표준편차
+    df['bollinger.band.upper'] = df['MA20'] + 2*df['stddev'] # 상단밴드
+    df['bollinger.band.lower'] = df['MA20'] - 2*df['stddev'] # 하단밴드
+
+    # 2.5. MACD(Moving Average Convergence  and Divergence)
+    # macd_short, macd_long, macd_signal = 12,26,9
+    df['MACD_short']  = df[price_column].rolling(macd_short).mean()
+    df['MACD_long']   = df[price_column].rolling(macd_long).mean()
+    df['MACD']        = df.apply(lambda x: (x['MACD_short']-x['MACD_long']), axis=1)
+    df['MACD_signal'] = df['MACD'].rolling(macd_signal).mean()  
+    df['MACD_sign']   = df.apply(lambda x: (1 if x['MACD']>x['MACD_signal'] else 0), axis=1)
+
+    # 2.6. 등락률 : (현재가 - 전일가) / 전일가
+    df['change'] = (df[price_column] - df[price_column].shift(1)) / df[price_column].shift(1)
+
+    # 2.7. 52주 평균 등락률
+    df['mean_change_52week'] = df['change'].groupby(df[ticker_column]).apply(lambda x: x.rolling(52*5).mean())
+
+    # 2.8. 52주 신고가 & 52주 신고가여부
+    max_price_52week    = np.repeat(np.nan, len(df))
+    is_max_price_52week = np.repeat(0     , len(df))
+    for i in range(len(df)):
+        # i=52*5-1
+        if i>=(52*5-1):
+            price_lately = df[price_column][i-(52*5-1):i-(-1)]
+            max_price_52week[i] = price_lately.max()
+            is_max_price_52week[i] = 1 if price_lately.max() == price_lately[-1] else 0
+    df['max_price_52week']    = max_price_52week
+    df['is_max_price_52week'] = is_max_price_52week
+    
+    # 2.9. 52주 컬럼을 만들면서 생긴 앞부분 날짜들 삭제
+    if date_remove:
+        df = df.iloc[52*5:]
+        
+    # # 2.10. NaN to Zero
+    # df = df.replace(np.nan, 0)
+
+    # 2.11. return feature column
+    if feature_columns is not None:
+        feature_columns += list(set(df.columns) - set(raw_df.columns))
+        return feature_columns, df
+    
+    else:
+        return df
+
+
+# 0.1.4. shuffle function
+def shuffle_in_unison(a, b):
+    # shuffle two arrays in the same way
+    
+    # a,b=[1,2,3], [4,5,6]
+    state = np.random.get_state()
+    np.random.shuffle(a)
+    np.random.set_state(state)
+    np.random.shuffle(b)
+
+# 0.1.5. model create function
+def create_model_fn(sequence_length, n_features, units=256, cell=LSTM, n_layers=2, dropout=0.3,
+                    loss="mean_absolute_error", optimizer="rmsprop", bidirectional=False):
+    
+    model = Sequential()
+    for i in range(n_layers):
+        # (1) first layer
+        if i == 0:
+            if bidirectional:
+                model.add(Bidirectional(cell(units, return_sequences=True), 
+                                        batch_input_shape=(None, sequence_length, n_features)))
+            else:
+                model.add(cell(units, return_sequences=True, 
+                               batch_input_shape=(None, sequence_length, n_features)))
+        # (2) last layer
+        elif i == n_layers - 1:
+            if bidirectional:
+                model.add(Bidirectional(cell(units, 
+                                             return_sequences=False)))
+            else:
+                model.add(cell(units, 
+                               return_sequences=False))
+        # (3) hidden layers
+        else:
+            if bidirectional:
+                model.add(Bidirectional(cell(units, 
+                                             return_sequences=True)))
+            else:
+                model.add(cell(units,
+                               return_sequences=True))
+                
+        # add dropout after each layer
+        model.add(Dropout(dropout))
+    model.add(Dense(1, activation="linear"))
+    model.compile(loss=loss, metrics=["mean_absolute_error"], optimizer=optimizer)
+    
+    return model
+
+# 0.1.6. plot for Test DataFrame
+def plot_graph(test_df):
+    """
+    This function plots true close price along with predicted close price
+    with blue and red colors respectively
+    """
+    plt.plot(test_df[f'true_adjclose_{LOOKUP_STEP}'], c='b')
+    plt.plot(test_df[f'adjclose_{LOOKUP_STEP}'], c='r')
+    plt.xlabel("Days")
+    plt.ylabel("Price")
+    plt.legend(["Actual Price", "Predicted Price"])
+    plt.show()
+
+# 0.1.7. 
+def get_final_df(model, data):
+    """
+    This function takes the `model` and `data` dict to 
+    construct a final dataframe that includes the features along 
+    with true and predicted prices of the testing dataset
+    """
+    # if predicted future price is higher than the current, 
+    # then calculate the true future price minus the current price, to get the buy profit
+    buy_profit  = lambda current, pred_future, true_future: true_future - current if pred_future > current else 0
+    # if the predicted future price is lower than the current price,
+    # then subtract the true future price from the current price
+    sell_profit = lambda current, pred_future, true_future: current - true_future if pred_future < current else 0
+    
+    X_test = data["X_test"]
+    y_test = data["y_test"]
+    
+    X_train = data["X_train"]
+    y_train = data["y_train"]
+    
+    # perform prediction and get prices
+    te_y_pred = model.predict(X_test)
+    tr_y_pred = model.predict(X_train)
+    if SCALE:
+        y_test = np.squeeze(data["column_scaler"]["adjclose"].inverse_transform(np.expand_dims(y_test, axis=0)))
+        te_y_pred = np.squeeze(data["column_scaler"]["adjclose"].inverse_transform(te_y_pred))
+        
+        y_train = np.squeeze(data["column_scaler"]["adjclose"].inverse_transform(np.expand_dims(y_train, axis=0)))
+        tr_y_pred = np.squeeze(data["column_scaler"]["adjclose"].inverse_transform(tr_y_pred))
+        
+    test_df  = data["test_df"]
+    train_df = data["train_df"]
+
+    # add predicted future prices to the dataframe
+    test_df [f"adjclose_{LOOKUP_STEP}"] = te_y_pred
+    train_df[f"adjclose_{LOOKUP_STEP}"] = tr_y_pred
+    # add true future prices to the dataframe
+    test_df [f"true_adjclose_{LOOKUP_STEP}"] = y_test
+    train_df[f"true_adjclose_{LOOKUP_STEP}"] = y_train
+    # sort the dataframe by date
+    test_df.sort_index(inplace=True)
+    train_df.sort_index(inplace=True)
+    
+    # add the buy profit column
+    test_df["buy_profit"] = list(map(buy_profit, 
+                                test_df["adjclose"], 
+                                test_df[f"adjclose_{LOOKUP_STEP}"], 
+                                test_df[f"true_adjclose_{LOOKUP_STEP}"])
+                                # since we don't have profit for last sequence, add 0's
+                                )
+    train_df["buy_profit"] = list(map(buy_profit, 
+                                train_df["adjclose"], 
+                                train_df[f"adjclose_{LOOKUP_STEP}"], 
+                                train_df[f"true_adjclose_{LOOKUP_STEP}"])
+                                # since we don't have profit for last sequence, add 0's
+                                )
+    # add the sell profit column
+    test_df["sell_profit"] = list(map(sell_profit, 
+                                  test_df["adjclose"], 
+                                  test_df[f"adjclose_{LOOKUP_STEP}"], 
+                                  test_df[f"true_adjclose_{LOOKUP_STEP}"])
+                                  # since we don't have profit for last sequence, add 0's
+                                  )
+    train_df["sell_profit"] = list(map(sell_profit, 
+                                       train_df["adjclose"], 
+                                       train_df[f"adjclose_{LOOKUP_STEP}"], 
+                                       train_df[f"true_adjclose_{LOOKUP_STEP}"])
+                                       # since we don't have profit for last sequence, add 0's
+                                   )
+
+    test_df  = test_df .loc[sorted(test_df .index)]
+    train_df = train_df.loc[sorted(train_df.index)]
+
+    final_df = {}
+    final_df["train_df"] = train_df
+    final_df["test_df"]  = test_df
+    
+    return final_df
+
+# 0.1.8. Predict.model function 
+def predict(model, data):
+    # retrieve the last sequence from data
+    last_sequence = data["last_sequence"][-N_STEPS:]
+    # expand dimension
+    last_sequence = np.expand_dims(last_sequence, axis=0)
+    # get the prediction (scaled from 0 to 1)
+    prediction = model.predict(last_sequence)
+    # get the price (by inverting the scaling)
+    if SCALE:
+        predicted_price = data["column_scaler"]["adjclose"].inverse_transform(prediction)[0][0]
+    else:
+        predicted_price = prediction[0][0]
+    return predicted_price
+
+
+# result[list(result)[0]]
+
+#===============================================================================================#
+# >>>>> 1. Data Load ----
+#===============================================================================================#
+
+# load data function
+def load_data(ticker, start_date, end_date, 
+              n_steps=50, lookup_step=1, test_size=0.2,
+              scale=True, shuffle=True, split_by_date=True, new_feature=True,
+              feature_columns=['adjclose', 'volume', 'open', 'high', 'low']):
+    
+    # ticker = 'AAPL'
+    # start_date, end_date = '2010-01-01', '2021-09-30' # None, None
+    # new_feature = True
+    # feature_columns = ['adjclose', 'volume', 'open', 'high', 'low']
+    # n_steps, lookup_step, test_size = 50, 15, 0.2
+    # scale, shuffle, split_by_date = True, True, True
+    
+    """
+    Loads data from Yahoo Finance source, as well as scaling, shuffling, normalizing and splitting.
+    Params:
+        (1) ticker (str/pd.DataFrame): the ticker you want to load, examples include AAPL, TESL, etc.
+        (2) n_steps (int): the historical sequence length (i.e window size) used to predict, default is 50
+        (3) scale (bool): whether to scale prices from 0 to 1, default is True
+        (4) shuffle (bool): whether to shuffle the dataset (both training & testing), default is True
+        (5) lookup_step (int): the future lookup step to predict, default is 1 (e.g next day)
+        (6) split_by_date (bool): whether we split the dataset into training/testing by date, setting it 
+            to False will split datasets in a random way
+        (7) test_size (float): ratio for test data, default is 0.2 (20% testing data)
+        (8) feature_columns (list): the list of features to use to feed into the model, default is everything grabbed from yahoo_fin
+    """
+    
+    #-----------------------------------------------------------------------------------------------------#
+    # 1.1. 주식데이터 불러오기
+    #-----------------------------------------------------------------------------------------------------#
+    # (1) ticker가 str인지 DataFrame인지 확인 후, 알맞게 데이터 생성
+    if isinstance(ticker, str):
+        # load it from yahoo_fin library
+        df = si.get_data(ticker, start_date, end_date).ffill()
+    elif isinstance(ticker, pd.DataFrame):
+        # already loaded, use it directly
+        df = ticker
+    else:
+        raise TypeError("ticker can be either a str or a `pd.DataFrame` instances")
+    
+    # end_date가 None인 경우 에러 -> df의 최대 날짜로 변경
+    if end_date is None: end_date = df.index.max()
+    
+    # (2) new feature
+    if new_feature:
+        feature_columns, df = new_feature_fn(df, 
+                                             price_column = 'adjclose', ticker_column = 'ticker', volume_column = 'volume',
+                                             macd_short=12, macd_long=26, macd_signal=9, 
+                                             date_remove = True, feature_columns = feature_columns)
+        locals()['FEATURE_COLUMNS'] = feature_columns
+    
+    # # 52주 신고가 plot확인
+    # plt.plot(df.index, df.adjclose)
+    # for i in range(len(df.is_max_price_52week)):
+    #     if df.is_max_price_52week[i]==1:
+    #         plt.axvline(df.index[i], color = 'r', linestyle = '--', linewidth = 0.1, alpha = 0.5)
+    # plt.show()
+    
+
+    # (3) df를 dict에 저장
+    result = {}
+    result['df'] = df.copy()
+    
+    # (4) feature_columns에 존재하지 않는 변수가있으면 메세지 출력
+    # assert (bool), 'message' : bool=True인 경우 아무것도 나오지않지만, bool=False인 경우 message가 출력
+    for col in feature_columns:
+        assert col in df.columns, f"'{col}' does not exist in the dataframe."
+    
+    # (5) Date변수 생성
+    # add date as a column
+    if "date" not in df.columns:
+        df.insert(0,'date',df.index)
+        
+    #-----------------------------------------------------------------------------------------------------#
+    # 2. Scaling
+    #-----------------------------------------------------------------------------------------------------#
+    # > expand_dims : axis = 0 - (1xn)으로 array를 펼침
+    #                 axis = 1 - (nx1)으로 array를 펼침
+    if scale:
+        column_scaler = {}
+        # scale the data (prices) from 0 to 1
+        for column in feature_columns:
+            scaler = preprocessing.MinMaxScaler()
+            df[column] = scaler.fit_transform(np.expand_dims(df[column].values, axis=1))
+            column_scaler[column] = scaler
+        # add the MinMaxScaler instances to the result returned
+        result["column_scaler"] = column_scaler
+        
+    # scaler_adjclose = result['column_scaler']['adjclose']
+    # scaler_adjclose.data_min_, scaler_adjclose.data_max_
+    # scaler_adjclose.feature_range
+
+    # add the target column (label) by shifting by 'lookup_step'
+    # lookup_step 이후의 가격
+    df['future'] = df['adjclose'].shift(-lookup_step)
+    # View(df[['adjclose','future']].tail(30))
+    
+    #-----------------------------------------------------------------------------------------------------#
+    # 3. Last Sequence
+    #-----------------------------------------------------------------------------------------------------#
+    # (1) last `lookup_step` columns contains NaN in future column
+    #     get them before droping NaNs
+    last_sequence = np.array(df[feature_columns].tail(lookup_step))
+    # drop NaNs
+    df.dropna(inplace=True)
+    
+    # (2) n_step개의 X, n_step에서의 y 데이터 생성
+    
+    # deque : 최대 maxlen개만 들어가는 array
+    #         그이상으로 들어가면, 오른쪽부터 순서대로 채워짐
+    
+    # zip(a,b) : (a,b)로 묶어줌
+    sequence_data = []
+    sequences = deque(maxlen=n_steps)
+    
+    # sequences     : n_step개의 row, column 개수의 col
+    # sequence_data : k * (sequence, target
+    #               => 2620 * ((50*28), 1 target)
+    for entry, target in zip(df[feature_columns + ["date"]].values, df['future'].values):
+        # print(entry, '\n')
+        sequences.append(entry)
+        if len(sequences) == n_steps:
+            # 50 entry, 1 target
+            sequence_data.append([np.array(sequences), target])
+            
+
+    # (3) Final Last sequence
+    # 위에서 실행된 sequences는 마지막 entry임
+    # Date컬럼 제외 마지막 entry + last_sequence
+    last_sequence = list([s[:len(feature_columns)] for s in sequences]) + list(last_sequence)
+    last_sequence = np.array(last_sequence).astype(np.float32)
+    # add to result
+    result['last_sequence'] = last_sequence
+    
+    #-----------------------------------------------------------------------------------------------------#
+    # 4. X,y
+    #-----------------------------------------------------------------------------------------------------#
+    # (1) construct the X's and y's
+    X, y = [], []
+    for seq, target in sequence_data:
+        X.append(seq)
+        y.append(target)
+        
+    # (2) convert to numpy arrays
+    X = np.array(X)
+    y = np.array(y)
+    
+    # (3) train/test split
+    # : 날짜별로 tr/te 나눌건지, 아닌지
+    if split_by_date:
+        # split the dataset into training & testing sets by date (not randomly splitting)
+        train_samples = int((1 - test_size) * len(X))
+        result["X_train"] = X[:train_samples]
+        result["y_train"] = y[:train_samples]
+        result["X_test"]  = X[train_samples:]
+        result["y_test"]  = y[train_samples:]
+        if shuffle:
+            # shuffle_in_unison(a,b) : a,b를 동일한 random state를 기준으로 섞음
+            # - shuffle the datasets for training (if shuffle parameter is set)
+            shuffle_in_unison(result["X_train"], result["y_train"])
+            shuffle_in_unison(result["X_test"] , result["y_test"])
+    else:    
+        # split the dataset randomly
+        result["X_train"], result["X_test"], result["y_train"], result["y_test"] = train_test_split(X, y, 
+                                                                                                    test_size=test_size, 
+                                                                                                    shuffle=shuffle)
+    #-----------------------------------------------------------------------------------------------------#
+    # 5. Raw train/test data
+    #-----------------------------------------------------------------------------------------------------#
+    # (1) Date 컬럼 가져오기
+    # [:,0,-1] : [all obs, X, last column]
+    te_dates = result["X_test"] [:, -1, -1]
+    tr_dates = result["X_train"][:, -1, -1]
+    
+    # min(tr_dates), max(tr_dates), min(te_dates), max(te_dates)
+    
+    # (2) (1)의 Date로 Raw 데이터셋 가져오기
+    result["train_df"] = result["df"].loc[tr_dates]
+    result["test_df"]  = result["df"].loc[te_dates]
+    
+    # (3) 중복값 제거
+    result["train_df"] = result["train_df"][~result["train_df"].index.duplicated(keep='first')]
+    result["test_df"]  = result["test_df"] [~result["test_df"] .index.duplicated(keep='first')]
+    
+    # (4) X,y에서 Date컬럼 제거
+    result["X_train"] = result["X_train"][:, :, :len(feature_columns)].astype(np.float32)
+    result["X_test"]  = result["X_test"] [:, :, :len(feature_columns)].astype(np.float32)
+    
+    return result
+
+# load the data
+data = load_data(ticker = TICKER, start_date = START_DATE, end_date = END_DATE,
+                 new_feature = NEW_FEATURE, feature_columns = FEATURE_COLUMNS,
+                 n_steps = N_STEPS, lookup_step = LOOKUP_STEP, test_size = TEST_SIZE,
+                 scale = SCALE, split_by_date = SPLIT_BY_DATE, shuffle=SHUFFLE)
+# data
+data.keys()
+
+# save the dataframe
+data["df"].to_csv(ticker_data_filename)
+
+# construct the model
+model = create_model_fn(sequence_length = N_STEPS, n_features = len(FEATURE_COLUMNS), 
+                        loss = LOSS, units = UNITS, cell = CELL, n_layers = N_LAYERS,
+                        dropout = DROPOUT, optimizer = OPTIMIZER, bidirectional = BIDIRECTIONAL)
+# model.summary()
+
+# # remove prev. RES/LOG
+# shutil.rmtree(os.path.join("RES", model_name + ".h5"), ignore_errors=True)
+# shutil.rmtree(os.path.join("LOG", model_name)        , ignore_errors=True)
+
+# some tensorflow callbacks
+checkpointer = ModelCheckpoint(os.path.join("RES", model_name + ".h5"), save_weights_only=True, save_best_only=True, verbose=1)
+tensorboard  = TensorBoard(log_dir=os.path.join("LOG", model_name))
+
+%clear
+
+
+import pickle
+# save data
+with open(f'./OUT/data_{DATE_NOW}','wb') as fw:
+    pickle.dump(data, fw)
+
+# load data
+with open(f'./OUT/data_{DATE_NOW}', 'rb') as fr:
+    data = pickle.load(fr)
+
+
+# %tensorboard --logdir "LOG/210916"
+
+# train the model and save the weights whenever we see 
+# a new optimal model using ModelCheckpoint
+# 30s x 500 = 15000s = 4.16h
+start_time = time.time()
+history = model.fit(x = data["X_train"], y = data["y_train"],
+                    batch_size = BATCH_SIZE,
+                    epochs = EPOCHS,
+                    validation_data = (data["X_test"], data["y_test"]),
+                    callbacks = [checkpointer, tensorboard],
+                    verbose=1)
+end_time = time.time()
+print(round( (end_time - start_time)/60, 2), "Mins")
+
+# %tensorboard --logdir "LOG\210916_test"
+
+data['running_time'] = end_time - start_time
+
+
+
+
+
+
+
+# load optimal model weights from results folder
+model_path = os.path.join("RES",model_name) + ".h5"
+model.load_weights(model_path)
+
+# evaluate the model
+loss, mae = model.evaluate(data["X_test"], data["y_test"], verbose=0)
+# calculate the mean absolute error (inverse scaling)
+if SCALE:
+    mean_absolute_error = data["column_scaler"]["adjclose"].inverse_transform([[mae]])[0][0]
+else:
+    mean_absolute_error = mae
+
+# get the final dataframe for the testing set
+final_df = get_final_df(model, data)
+final_df.keys()
+
+tr_final_df = final_df["train_df"]
+te_final_df = final_df["test_df"]
+
+final_df["train_df"].loc[sorted(final_df["train_df"].index)]
+final_df["test_df"] .loc[sorted(final_df["test_df"] .index)]
+
+plt.plot(tr_final_df.index, tr_final_df.adjclose_15)
+plt.plot(tr_final_df.index, tr_final_df.true_adjclose_15)
+plt.show()
+
+plt.plot(te_final_df.index, te_final_df.adjclose_15)
+plt.plot(te_final_df.index, te_final_df.true_adjclose_15)
+plt.show()
+
+tr_final_df[['adjclose','adjclose_15','true_adjclose_15']]
+
+# predict the future price
+future_price = predict(model, data)
+data['df'].adjclose[-1]
+
+# we calculate the accuracy by counting the number of positive profits
+accuracy_score = (len(te_final_df[te_final_df['sell_profit'] > 0]) + len(te_final_df[te_final_df['buy_profit'] > 0])) / len(te_final_df)
+
+# calculating total buy & sell profit
+total_buy_profit  = te_final_df["buy_profit"].sum()
+total_sell_profit = te_final_df["sell_profit"].sum()
+
+# total profit by adding sell & buy together
+total_profit = total_buy_profit + total_sell_profit
+
+# dividing total profit by number of testing samples (number of trades)
+profit_per_trade = total_profit / len(te_final_df)
+
+# printing metrics
+data['df']
+print('\n')
+print(f"Future price after {LOOKUP_STEP} days is {future_price:.2f}$") # 126.72$
+print(f"{LOSS} loss:", loss)
+print("Mean Absolute Error:", mean_absolute_error)
+print("Accuracy score:", accuracy_score)
+print("Total buy profit:", total_buy_profit)
+print("Total sell profit:", total_sell_profit)
+print("Total profit:", total_profit)
+print("Profit per trade:", profit_per_trade)
+
+# plot true/pred prices graph
+plot_graph(te_final_df)
+
+check_cols = ['ticker','open','high','low','close','adjclose','adjclose_15','true_adjclose_15']
+View(te_final_df[check_cols].tail(10))
+# save the final dataframe to csv-results folder
+csv_results_folder = "csv-results"
+if not os.path.isdir(csv_results_folder):
+    os.mkdir(csv_results_folder)
+csv_filename = os.path.join(csv_results_folder, model_name + ".csv")
+final_df.to_csv(csv_filename)
+
+
+f = pd.concat([final_df["train_df"], final_df["test_df"]])
+f.sort_index
+final_df["train_df"]
+
+pd.DataFrame(data["X_train"])
+
+
+a = pd.DataFrame(data["X_train"][0])
+
+
+View(final_df)

@@ -1,0 +1,589 @@
+#===============================================================================================#
+# 파 일 명 : 주식 종가 예측 쿼리
+# 시작날짜 : 2021.09.08
+# 수정날짜 : 2021.09.08
+# 작 성 자 : 김혁진
+# 작성주제 : Dacon / 주식 종가 예측
+#===============================================================================================#
+# >>>>> 순서
+# 
+# 
+#
+#===============================================================================================#
+# >>>>> 참조
+#
+# 1. nmae metric 설명 : https://mizykk.tistory.com/102
+#
+#===============================================================================================#
+# >>>>> 고려사항
+#
+# 1. per, pbr 등 : https://psystat.tistory.com/117
+#
+#===============================================================================================#
+
+
+#===============================================================================================#
+# > 0. 기본설정
+#===============================================================================================#
+
+# 0.1. Import Modules
+import sys
+import time
+import datetime
+import os
+import pandas as pd
+import numpy as np
+import math
+import warnings
+import FinanceDataReader as fdr
+from tqdm import tqdm
+from sklearn.linear_model import LinearRegression
+from xgboost import XGBRegressor
+from sklearn.ensemble import RandomForestRegressor
+
+import matplotlib.pyplot as plt
+
+# 0.2. warning option
+warnings.filterwarnings("ignore")
+
+# 0.3. Path 지정
+os.chdir("F:/USB포맷_210223/STUDY/Dacon/12. 주식 종가 예측")
+
+# 0.4. User defined Function
+# 0.4.1. View all columns
+def View(data):
+    pd.set_option('display.max_rows', 500)
+    pd.set_option('display.max_columns', 500)
+    pd.set_option('display.width', 1000)
+    
+    print(data)
+
+    pd.set_option('display.max_rows', 0)
+    pd.set_option('display.max_columns', 0)
+    pd.set_option('display.width', 0)
+
+# 0.4.2. Pivot_table
+def pivot_table(data, index, columns, values, type = str):
+    # data = data2
+    # values  = 'Date' # 'Open'
+    # columns = 'weekday'
+    # index   = 'weeknum'
+    # type    = str
+    df = pd.DataFrame(index = sorted(data[index].unique()), columns = sorted(data[columns].unique()))
+    for i in range(df.shape[0]):
+        for j in range(df.shape[1]):
+            # i,j = 0,1
+            loc = np.where((data[index] == df.index[i]) & (data[columns] == df.columns[j]))
+            df.iloc[i,j] = data[values].iloc[loc].astype(type).values[0]
+    df.columns = values + '_' + df.columns.astype(str)
+    return df
+
+# 0.4.3. NAME function
+def nmae_fn(true,pred):
+    # true = raw_data[['Close']]  .loc[~np.isnan(raw_data.Close),:].values
+    # pred = raw_data[['rf_pred']].loc[~np.isnan(raw_data.Close),:].values
+    return np.mean(abs((true-pred))/(true))*100
+
+# 0.4.4. New Feature
+def new_feature_fn(stock_df,
+                   price_column = 'Close', ticker_column = 'Ticker', 
+                   volume_column = 'Volume', change_column = 'Change',
+                   macd_short=12, macd_long=26, macd_signal=9):
+
+    # stock_df = data#.head(110)
+    # price_column = 'Close'
+    # ticker_column = 'Ticker'
+    # volume_column = 'Volume'
+    # change_column = 'Change'
+    # macd_short=12
+    # macd_long=26
+    # macd_signal=9
+    
+    # 2.1. Moving Average for Close price : 5,10,20,60,120
+    stock_df['MA5'  ] = stock_df[price_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(5).mean())
+    stock_df['MA10' ] = stock_df[price_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(10).mean())
+    stock_df['MA20' ] = stock_df[price_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(20).mean())
+    stock_df['MA60' ] = stock_df[price_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(60).mean())
+    stock_df['MA120'] = stock_df[price_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(120).mean())
+    
+    # 2.2. Moving Average for Volume : 5,10,20,60,120
+    stock_df[volume_column + '.MA5'  ] = stock_df[volume_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(5).mean())
+    stock_df[volume_column + '.MA10' ] = stock_df[volume_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(10).mean())
+    stock_df[volume_column + '.MA20' ] = stock_df[volume_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(20).mean())
+    stock_df[volume_column + '.MA60' ] = stock_df[volume_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(60).mean())
+    stock_df[volume_column + '.MA120'] = stock_df[volume_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(120).mean())
+    
+    # # 2.3. weekday, month
+    # stock_df['weekday'] = stock_df.index.dayofweek + 1 # 월요일을 1로
+
+    # 2.4. 볼린저밴드
+    stock_df['stddev'] = stock_df[price_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(20).std()) # 20일 이동표준편차
+    stock_df['bollinger.band.upper'] = stock_df['MA20'] + 2*stock_df['stddev'] # 상단밴드
+    stock_df['bollinger.band.lower'] = stock_df['MA20'] - 2*stock_df['stddev'] # 하단밴드
+
+    # 2.5. MACD(Moving Average Convergence  and Divergence)
+    # macd_short, macd_long, macd_signal = 12,26,9
+    stock_df["MACD_short"]  = stock_df[price_column].rolling(macd_short).mean()
+    stock_df["MACD_long"]   = stock_df[price_column].rolling(macd_long).mean()
+    stock_df["MACD"]        = stock_df.apply(lambda x: (x["MACD_short"]-x["MACD_long"]), axis=1)
+    stock_df["MACD_signal"] = stock_df["MACD"].rolling(macd_signal).mean()  
+    stock_df["MACD_sign"]   = stock_df.apply(lambda x: (1 if x["MACD"]>x["MACD_signal"] else 0), axis=1)
+
+    # 2.6. 52주 평균 등락률
+    stock_df['mean_change_52week'] = stock_df[change_column].groupby(stock_df[ticker_column]).apply(lambda x: x.rolling(52*5).mean())
+
+    # # 2.6. NaN to Zero
+    # stock_df = stock_df.replace(np.nan, 0)
+
+    # view_col = ['MA5','MA10','MA20','MA60','MA120','Volume.MA5','Volume.MA10','Volume.MA20','Volume.MA60','Volume.MA120',
+    #             'stddev','bollinger.band.upper','bollinger.band.lower']
+    # View(stock_df[view_col])
+
+    return stock_df
+
+# 0.5. Initial Values
+# 0.5.1. Stock Date : Start(monday), End(friday)
+# (8/30~9/3), (9/13~9/17)
+TR_START_DATE = '20190107' # 월요일
+TR_END_DATE   = '20210827' # 금요일
+TE_END_DATE   = '20210917' # 금요일
+SEED = 777
+
+# check
+if pd.to_datetime(TR_START_DATE).weekday() != 0:
+    sys.exit("TR_START_DATE must be Monday")
+elif pd.to_datetime(TR_END_DATE).weekday() != 4:
+    sys.exit("TR_END_DATE must be Friday")
+elif pd.to_datetime(TE_END_DATE).weekday() != 4:
+    sys.exit("TE_END_DATE must be Friday")
+
+
+
+#===============================================================================================#
+# > 1. Data Load
+#===============================================================================================#
+stock_df = pd.read_csv('./DAT/Stock_List.csv')
+stock_df['종목코드'] = stock_df['종목코드'].apply(lambda x : str(x).zfill(6))
+# stock_df['상장시장'].value_counts()
+
+submission_df = pd.read_csv('./DAT/sample_submission_week3.csv')
+
+
+#===============================================================================================#
+# > 2. Model Fitting
+#===============================================================================================#
+
+# 평일(Business Day)에 맞도록 데이터 맞추기
+# start_weekday = pd.to_datetime(TR_START_DATE).weekday()
+# max_weeknum   = pd.to_datetime(TE_END_DATE).strftime('%V')
+sub = submission_df.copy()[['Day']]
+
+lm_model  = LinearRegression()
+rf_model  = RandomForestRegressor(random_state=SEED, criterion='mae')
+xgb_model = XGBRegressor(random_state=SEED)
+
+total_start_time = time.time()
+tqdm_dataset = tqdm(stock_df['종목코드'].values, position=0, leave=False)
+for code in tqdm_dataset:
+    # code = stock_df['종목코드'].values[0]
+    
+    start_time = time.time()
+    
+    #----------------------------------------------------------------------------------------------------#
+    # 2.1. Load Data
+    #----------------------------------------------------------------------------------------------------#
+    # 주가데이터 불러오기
+    features = ['Open','High','Low','Volume','Change','Close']
+    
+    # 1주 전을 validation data로 활용
+    tr_end_date = pd.to_datetime(TR_END_DATE) + datetime.timedelta(days=-7) # train 마지막 1주전 금요일
+    va_end_date = pd.to_datetime(tr_end_date) + datetime.timedelta(days= 7) # train 마지막 주 금요일
+    
+    # train / valid dataset load
+    tr_fdr_data = fdr.DataReader(code, start = TR_START_DATE, end = va_end_date)[features].reset_index()
+    
+    # validation에 맞는 날짜 마스터테이블 생성
+    Business_days = pd.DataFrame(pd.date_range(TR_START_DATE,va_end_date,freq='B'), columns = ['Date'])
+    
+    # business day에 맞도록 outer join
+    data = pd.merge(Business_days, tr_fdr_data, how = 'outer')
+    
+    data['valid_idx'] = (data.Date > tr_end_date) & (data.Date <= va_end_date)
+    
+    # weekday 생성
+    data['weekday'] = data.Date.apply(lambda x : x.weekday())
+    
+   
+    #----------------------------------------------------------------------------------------------------#
+    # 2.2. New Feature
+    #----------------------------------------------------------------------------------------------------#
+    # new feature 하기 전에, 주가컬럼 ffill
+    fill_loc = data.Date <= tr_fdr_data.Date.max()
+    data.loc[fill_loc, :] = data.loc[fill_loc, :].ffill()
+    
+    # new feature
+    data['Ticker'] = code
+    data2 = new_feature_fn(data.copy())
+
+    # 52주 
+    # 앞의 52*5개를 삭제해줌(월요일부터 시작하도록)
+    data2 = data2.iloc[260:,:].reset_index()    
+    # data2.apply(lambda x: sum(np.isnan(x))).value_counts()
+    
+    # weeknum 생성
+    weeknum_x = 0
+    weeknum = []
+    for i, weekday in enumerate(data2.weekday):
+        if (i>1) and weekday==0: weeknum_x += 1
+        weeknum.append(weeknum_x)
+    
+    data2['weeknum'] = weeknum
+    
+    # # front/back fill : 앞/뒤에서부터 채워나가는거
+    # data2 = data2.ffill().bfill()
+    
+    # features column
+    for c in data2.columns.difference(data.columns):
+        features.append(c)
+        # data2[c] = data2[c].replace(np.nan, 0)
+        
+    # nan인 컬럼 지우기(ffill, bfill 했는데도 NaN이면 모두 NaN임)
+    for feature in features:
+        # feature = features[0]
+        if sum(np.isnan(data2[feature]))>5:
+            features = set(features) - {feature}
+            del data2[feature]
+    
+    raw_data = data2.copy()
+    # View(raw_data.tail(110).iloc[:,20:25])
+    # View(raw_data.head(110).iloc[:,20:25])
+    
+    # View(data2[['Date','MA60']])
+    # View(data2[data2.columns.difference(data.columns)])
+
+    #----------------------------------------------------------------------------------------------------#
+    # 2.3. (validation) Dataset for Modelling
+    #      - ~8/16~20일 데이터로 8/23~27일 데이터 예측
+    #----------------------------------------------------------------------------------------------------#
+    # x축(index)을 weeknum, y축(columns)를 weekday, 값(values)를 Close로 하는 pivot table 생성
+    model_data = pd.DataFrame()
+    for feature in features:
+        # feature = features[0]
+        d = pivot_table(data = data2, values = feature, columns = 'weekday', index = 'weeknum', type=float)
+        model_data = pd.concat([model_data, d], axis = 1)
+
+    date_data = pivot_table(data = data2, values = 'Date', columns = 'weekday', index = 'weeknum', type=str)         
+    # va_end_date        
+    
+    target_column = ['Close_' + str(string) for string in range(5)]
+    
+    date_data.iloc[0:-1]
+    date_data.iloc[1:]
+    x = model_data.iloc[0:-1].to_numpy()                      # 0주차 ~ (N-1)주차 데이터로
+    y = model_data.iloc[1:].loc[:,target_column].to_numpy() # 1주차 ~ (N)  주차 데이터를 학습 
+    
+    # 각 요일에대해서 적합(segment)
+    y_0 = y[:,0]
+    y_1 = y[:,1]
+    y_2 = y[:,2]
+    y_3 = y[:,3]
+    y_4 = y[:,4]
+
+    y_values = [y_0, y_1, y_2, y_3, y_4]
+    x_values = model_data.iloc[-1:].to_numpy()  
+    
+    #----------------------------------------------------------------------------------------------------#
+    # 2.4. (validation) Modelling
+    #----------------------------------------------------------------------------------------------------#
+    lm_predictions, xgb_predictions, rf_predictions = [],[],[]
+    for y_value in y_values :
+        # y_value = y_values[0]
+
+        lm_model.fit(x,y_value)
+        lm_prediction = lm_model.predict(x_values)
+        lm_predictions.append(lm_prediction)
+        
+        rf_model.fit(x,y_value)
+        rf_prediction = rf_model.predict(x_values)
+        rf_predictions.append(rf_prediction)
+        
+        xgb_model.fit(x,y_value)
+        xgb_prediction = xgb_model.predict(x_values)
+        xgb_predictions.append(xgb_prediction)
+    
+    lm_predictions
+    y
+    
+    #----------------------------------------------------------------------------------------------------#
+    # 2.5. (validation) Predicted Value
+    #----------------------------------------------------------------------------------------------------#
+    lm_pred  = pd.DataFrame(lm_predictions).transpose()
+    rf_pred  = pd.DataFrame(rf_predictions).transpose()
+    xgb_pred = pd.DataFrame(xgb_predictions).transpose()
+    
+    lm_pred_x  = pd.DataFrame(columns = ['value'])
+    rf_pred_x  = pd.DataFrame(columns = ['value'])
+    xgb_pred_x = pd.DataFrame(columns = ['value'])
+    
+    for i in range(lm_pred.shape[0]):
+        # i=0
+        
+        lm_pred_xx = lm_pred.iloc[i,:].values
+        lm_pred_xx = pd.DataFrame(lm_pred_xx, columns = ['value']).reset_index()
+        lm_pred_x = pd.concat([lm_pred_x, lm_pred_xx], axis = 0)
+        
+        rf_pred_xx = rf_pred.iloc[i,:].values
+        rf_pred_xx = pd.DataFrame(rf_pred_xx, columns = ['value']).reset_index()
+        rf_pred_x = pd.concat([rf_pred_x, rf_pred_xx], axis = 0)
+        
+        xgb_pred_xx = xgb_pred.iloc[i,:].values
+        xgb_pred_xx = pd.DataFrame(xgb_pred_xx, columns = ['value']).reset_index()
+        xgb_pred_x = pd.concat([xgb_pred_x, xgb_pred_xx], axis = 0)
+    
+   
+    raw_data['lm_pred']  = lm_pred_x.value.values
+    raw_data['rf_pred']  = rf_pred_x.value.values
+    raw_data['xgb_pred'] = xgb_pred_x.value.values
+    
+    # raw_data.loc[raw_data.valid_idx,['Close.true','rf_pred']]
+    
+    # raw_data.loc[raw_data.valid_idx,['Date','Close','lm_pred','rf_pred','xgb_pred']]
+    
+    plot_data = raw_data.tail(100)
+    plt.plot(plot_data.Date, plot_data.Close   , 'black')
+    plt.plot(plot_data.Date, plot_data.lm_pred.shift(5) , 'orange', alpha = 0.5)
+    plt.show()
+
+    nmae_fn(true = raw_data.Close, pred = plot_data.lm_pred.shift(5))
+
+    p = np.arange(0,1,0.01)
+    nmae = []
+    for iter in range(len(p)):
+        # iter = 0
+        d = raw_data[raw_data.valid_idx]
+        pred = p[iter]*d.rf_pred + (1-p)[iter]*d.xgb_pred
+        nmae_x = nmae_fn(true = raw_data[raw_data.valid_idx].Close, 
+                         pred = pred)    
+        # 0.3 + p[iter] + (0.7-p)[iter]
+        nmae.append(nmae_x)
+    
+    raw_data['p'] = p[np.argmin(nmae)]
+    raw_data['p_nmae'] = nmae[np.argmin(nmae)]
+
+    raw_data['pred'] = p[np.argmin(nmae)]*raw_data.rf_pred + (1-p[np.argmin(nmae)])*raw_data.xgb_pred
+
+    end_time = time.time()
+    running_time = end_time - start_time
+    cum_running_time = end_time - total_start_time
+
+    raw_data['tr_idx'] = fill_loc
+    # pd.crosstab(raw_data.tr_idx, raw_data.valid_idx)
+
+    # plot_data = raw_data.tail(30) #[raw_data.valid_idx]
+    # plt.plot(plot_data.Date, plot_data.Close)
+    # plt.plot(plot_data.Date, plot_data.pred)
+    # plt.axvline(x=raw_data.Date[raw_data.valid_idx].min(), color='r', linewidth=1, linestyle=':')
+    # plt.show()
+    # plot_data[['Date','Close','pred']]
+
+    
+
+    #----------------------------------------------------------------------------------------------------#
+    # 2.6. (test) Dataset for Modelling
+    #----------------------------------------------------------------------------------------------------#
+    # x축(index)을 weeknum, y축(columns)를 weekday, 값(values)를 Close로 하는 pivot table 생성
+    data3 = raw_data
+    data3.Close = pd.concat([raw_data.Close[:-5], raw_data.pred[-5:]])
+    
+    # validation에 맞는 날짜 마스터테이블 생성
+    te_end_date = pd.to_datetime(data3.Date.max()) + datetime.timedelta(days=7)
+    Business_days = pd.DataFrame(pd.date_range(data3.Date.min(),te_end_date,freq='B'), columns = ['Date'])
+    
+    # business day에 맞도록 outer join
+    data4 = pd.merge(Business_days, data3, how = 'outer', on = 'Date')
+    
+    model_data2 = pd.DataFrame()
+    for feature in features:
+        # feature = features[0]
+        d = pivot_table(data = data4, values = feature, columns = 'weekday', index = 'weeknum', type=float)
+        model_data2 = pd.concat([model_data2, d], axis = 1)
+
+    date_data2 = pivot_table(data = data4, values = 'Date', columns = 'weekday', index = 'weeknum', type=str)         
+    # va_end_date        
+    
+    target_column = ['Close_' + str(string) for string in range(5)]
+    
+    x = model_data2.iloc[:-1].to_numpy()                      # 0주차 ~ (N-1)주차 데이터로
+    y = model_data2.iloc[ 1:].loc[:,target_column].to_numpy() # 1주차 ~ (N)  주차 데이터를 학습 
+    
+    # 각 요일에대해서 적합(segment)
+    y_0 = y[:,0]
+    y_1 = y[:,1]
+    y_2 = y[:,2]
+    y_3 = y[:,3]
+    y_4 = y[:,4]
+
+    y_values = [y_0, y_1, y_2, y_3, y_4]
+    x_values = model_data2.to_numpy()
+
+
+    #----------------------------------------------------------------------------------------------------#
+    # 2.7. (test) Modelling
+    #----------------------------------------------------------------------------------------------------#
+    lm_predictions, xgb_predictions, rf_predictions = [],[],[]
+    for y_value in y_values :
+        # y_value = y_values[0]
+        
+        lm_model.fit(x,y_value)
+        lm_prediction = lm_model.predict(x_values)
+        lm_predictions.append(lm_prediction)
+        
+        rf_model.fit(x,y_value)
+        rf_prediction = rf_model.predict(x_values)
+        rf_predictions.append(rf_prediction)
+        
+        xgb_model.fit(x,y_value)
+        xgb_prediction = xgb_model.predict(x_values)
+        xgb_predictions.append(xgb_prediction)
+    
+    
+    #----------------------------------------------------------------------------------------------------#
+    # 2.5. (validation) Predicted Value
+    #----------------------------------------------------------------------------------------------------#
+    lm_pred  = pd.DataFrame(lm_predictions).transpose()
+    rf_pred  = pd.DataFrame(rf_predictions).transpose()
+    xgb_pred = pd.DataFrame(xgb_predictions).transpose()
+    
+    lm_pred_x  = pd.DataFrame(columns = ['value'])
+    rf_pred_x  = pd.DataFrame(columns = ['value'])
+    xgb_pred_x = pd.DataFrame(columns = ['value'])
+    
+    for i in range(lm_pred.shape[0]):
+        # i=0
+        
+        lm_pred_xx = lm_pred.iloc[i,:].values
+        lm_pred_xx = pd.DataFrame(lm_pred_xx, columns = ['value']).reset_index()
+        lm_pred_x = pd.concat([lm_pred_x, lm_pred_xx], axis = 0)
+        
+        rf_pred_xx = rf_pred.iloc[i,:].values
+        rf_pred_xx = pd.DataFrame(rf_pred_xx, columns = ['value']).reset_index()
+        rf_pred_x = pd.concat([rf_pred_x, rf_pred_xx], axis = 0)
+        
+        xgb_pred_xx = xgb_pred.iloc[i,:].values
+        xgb_pred_xx = pd.DataFrame(xgb_pred_xx, columns = ['value']).reset_index()
+        xgb_pred_x = pd.concat([xgb_pred_x, xgb_pred_xx], axis = 0)
+    
+    
+    p[np.argmin(nmae)]*rf_pred_x.value + (1-p[np.argmin(nmae)])*xgb_pred_x.value
+    
+    data3['lm_pred']  = np.nan
+    raw_data['rf_pred']  = np.nan
+    raw_data['xgb_pred'] = np.nan
+    
+    raw_data['lm_pred'][5:]  = lm_pred_x.value.values
+    raw_data['rf_pred'][5:]  = rf_pred_x.value.values
+    raw_data['xgb_pred'][5:] = xgb_pred_x.value.values
+
+
+
+
+
+    tqdm_dataset.set_postfix({
+        'Time' : f'{round(running_time / 60, 1)} Mins',
+        'CumTime' : f'{round(cum_running_time / 60, 1)} Mins'
+    })
+    
+    raw_data.to_csv(f'./OUT/rf_{code}.csv', index=False)
+
+total_end_time = time.time()
+total_running_time = total_end_time - total_start_time
+f'{round(total_running_time / 60, 1)} Mins'
+
+
+f = pd.DataFrame()
+for code in tqdm(stock_df['종목코드']):
+    # code = stock_df['종목코드'][1]
+    d = pd.read_csv(f'./OUT/rf_{code}.csv')
+    f = pd.concat([f, d], axis = 0)
+
+f['pred'] = 0.5*f.rf_pred + 0.5*f.xgb_pred
+f.pred = f.pred.shift(5*1)
+# nmae_fn(f[f.valid_idx]['Close.true'],f[f.valid_idx]['pred'])
+# nmae_fn(f[f.valid_idx]['Close.true'],f[f.valid_idx]['rf_pred'])
+# nmae_fn(f[f.valid_idx]['Close.true'],f[f.valid_idx]['xgb_pred'])
+
+sub = submission_df[['Day']]
+for code in sorted(stock_df['종목코드'].astype(int)):
+    # code = sorted(stock_df['종목코드'].astype(int))[2]
+    tmp = f.loc[f.Ticker==code,['Date','pred']]
+    tmp.pred = round(tmp.pred,0)
+    tmp = tmp.rename(columns = {'Date' : 'Day', 'pred' : str(code)})
+    sub = pd.merge(sub, tmp, how = 'left', on = 'Day')
+
+columns = list(sub.columns[1:])
+columns = ['Day'] + [str(x).zfill(6) for x in columns]
+sub.columns = columns
+
+sub.to_csv('./OUT/mixed_model.csv', index=False, encoding = 'utf-8-sig')
+
+sub.shape, submission_df.shape
+sum(sub.columns != submission_df.columns)
+
+
+# !pip install dacon_submit_api-0.0.4-py3-none-any.whl
+from dacon_submit_api import dacon_submit_api 
+
+# 개인 토큰 발급 (https://dacon.io/account 에서 발급 가능)
+파일경로 =  './OUT/mixed_model.csv'
+개인_Token = '5b6b9f07b183a19b0d9f349a57018b7d0374e79a7aae6efe74ee6924a6b5f3f7'
+대회ID = '235800' # 주식종가예측 대회 ID 
+팀이름 = 'KHJ'    # 현 대회에 참여중인 팀 명 (https://dacon.io/competitions/official/235800/team 에서 확인 가능)
+submission_메모_내용 = '(1차) baseline code + RF'
+
+result = dacon_submit_api.post_submission_file(
+파일경로, 
+개인_Token, 
+대회ID, 
+팀이름, 
+submission_메모_내용)
+
+
+
+
+
+
+
+
+
+
+
+ticker = f.Ticker.unique()[60]
+g = f.loc[(f.Ticker == ticker) & f.tr_idx].tail(80)
+
+plt.plot(g.Date, g['Close.true'], 'black')
+plt.plot(g.Date, g.pred,  'gray')
+# plt.plot(g.Date, g.rf_pred, 'orange', alpha=0.5)
+# plt.plot(g.Date, g.xgb_pred, 'blue', alpha=0.5)
+plt.show()
+
+nmae_fn(true = g.Close,pred = g.rf_pred), nmae_fn(true = g.Close,pred = g.xgb_pred)
+nmae_fn(true = f.Close,pred = f.rf_pred), nmae_fn(true = f.Close,pred = f.xgb_pred)
+
+
+
+a = f[['Ticker','Date','rf_pred']].loc[f.index.values>=180,:]
+
+submission_df2 = submission_df[['Day']]
+for code in sorted(stock_df['종목코드'].astype(int)):
+    # code = stock_df['종목코드'].astype(int)[0]
+    b = a.loc[a.Ticker==code]
+    b.columns = ['Ticker','Day',code]
+    del b['Ticker']
+
+    submission_df2 = pd.merge(submission_df2, b, how='left', on='Day')
+    
+submission_df2
+
+submission_df2.to_csv('./OUT/random_forest_result.csv', index=False, encoding='utf-8', header=True)
+
+

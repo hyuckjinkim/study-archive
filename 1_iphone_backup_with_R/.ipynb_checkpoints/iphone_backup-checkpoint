@@ -1,0 +1,389 @@
+#===============================================================================================#
+# 시작날짜 : 2020.04.10 
+# 수정날짜 : 2020.05.10
+# 작 성 자 : 김혁진
+# 작성주제 : 아이폰 사진 백업
+#===============================================================================================#
+# - 기본지식 ----
+#
+# 1. (필터없는 사진) -> (필터) -> (필터있는사진) 의 형태로 생성이 됨.
+#    ex) (IMG_100.JPEG) -> (IMG_100.AAE) -> (IMG_E100.JPEG)
+#    따라서 필터없는 사진과 AAE파일은 필요가 없음
+#
+# 2. 아이폰에서는 용량 감소를 위해 고효율성 사진은 HEIC로, 높은호환성 사진은 JPEG로 저장
+#    HEIC 파일은 변환이 필요
+#    HEIC 변환과정에서 에러(실패 등)가 생길 수 있으므로 JPEG를 선택(HEIC 삭제)하는 것이 바람직함
+#
+# 3. IMG_숫자로 되어있지 않은 파일들은 아이폰 카메라로 찍은 사진이 아니라 캡쳐, 다운로드 등
+#    따라서 이런 파일들은 필터가 적용되지 않으므로 수정할 필요가 없음
+#    
+#===============================================================================================#
+# - 고려사항 ----
+# 
+# 1. 필터파일 삭제
+#    => AAE파일 삭제
+#
+# 2. 필터없는 사진과 필터있는 사진이 같이 있으면 필터없는 사진을 삭제
+#    => (100, E100)이 있으면 100을 삭제
+#    
+#   이후에, 사진들은 이름순서가 시간순서에 해당하므로 이름에서 E를 제거
+#    => E100을 100으로 이름바꾸기
+#    
+# 3. 되도록 HEIC 파일을 삭제하는 방향으로 진행
+#    => (100.HEIC, E100.JPEG) 있으면 E100.JPEG 쓰기 : HEIC 확장자는 안쓰는 위주로
+#
+# 4. HEIC랑 (JPG / PNG / MOV)가 같이 있으면 선택적으로 삭제
+#    1) HEIC, JPG -> 확인해보고 뭐가 좋은지 선택
+#    2) HEIC, JPG, MOV -> MOV
+#    3) 
+#
+# 5. 아이폰에 있는 사진이랑 처리 후 개수랑 같으면 성공
+#
+# 6. 같은이름 확장자 빈도수보고(table), for문으로 하지말고 따로따로 해야할듯
+#===============================================================================================#
+
+
+#===============================================================================================#
+# 0. 초기설정 ----
+#===============================================================================================#
+# 환경 초기화
+rm(list=ls())
+gc(reset=T)
+
+# 라이브러리
+library(dplyr)
+library(pbapply)      
+library(filesstrings) # file.move
+library(progress)     # progress_bar
+
+# pbapply options
+pboptions(char="=")
+
+# 사진이 있는 폴더 디렉토리
+dir1 <- "C:/Users/My/Desktop/copy/20200424(고속연사촬영있는거,1186되야하는데 두개모자람)"
+dir2 <- list.files(dir1)
+
+#==============================================================================================================#
+# 목표사진개수 : 아이폰에 나오는 사진개수 + ( 고속연속촬영 전체 사진개수 - 고속연속촬영 묶음개수 )
+#              : 아이폰에 나오는 사진개수는 고속연속촬영 묶음 개수를 포함하기 때문
+#
+# eg) 기본사진 2개 + 고속연속촬영 10개 한묶음
+#     = 아이폰에 3개로 나타남
+#     = 전체 12개 사진 = 3 + 10 - 1
+#
+# * 아이폰에서는 고속연속촬용 개별 사진개수를 합쳐서 나타내지 않음
+# * 처리후와 사진의 개수를 비교하기 위하여
+#
+# * MOV : 비디오 + Live
+# * PNG : 스크린샷
+#==============================================================================================================#
+
+# 아이폰에 나오는 사진 개수 : 795장
+img.len <- 795
+
+# 고속연속촬영 사진 개수 
+high.len <- NULL
+
+target.len <- img.len + ( sum(high.len) - length(high.len) )
+
+# target img length
+cat(paste0("목표사진개수 : ", target.len))
+
+#==============================================================================================================#
+# 1. 모든 폴더에서 AAE 파일 삭제 ----
+#==============================================================================================================#
+
+# 해당 폴더(APPLE100, APPLE101, ...)에 파일을 유지시키기 위해서 (i,j)로 만듦
+pblapply(seq_along(dir2), function(i){
+  
+  # i <- 1
+  dir <- list.files(paste0(dir1, "/", dir2[i]))
+  
+  # 아이폰에서 사진을 삭제한 후에 컴퓨터로 복사할 경우에는 빈 폴더가 있을 수도 있음.
+  if ( length(dir) != 0 ){
+    
+    # 해당 폴더에 들어있는 .AAE파일을 삭제
+    for ( j in 1:length(dir) ){
+      
+      # j <- 5
+      # AAE 확장자명이면 삭제
+      if ( grepl("[.]AAE", dir[j]) ){
+        file.remove(paste0(dir1, "/", dir2[i], "/", dir[j]))
+      }
+    }
+  }
+})
+
+# AAE 파일 제거 후 나와야하는 파일의 숫자
+# 2906 - 1377 = 1529
+lapply(paste0(dir1, "/", dir2), function(x) length(list.files(x))) %>% 
+  do.call(sum, .)
+
+
+#==============================================================================================================#
+# 2. E붙은게 있으면 상황에 따라 old 또는 new를 삭제 ----
+#    IMG_숫자.확장자로만 되있는거만 대상으로 작업 : 아이폰에서 찍은 것들, 캡쳐 등 제외
+#==============================================================================================================#
+
+# file <- list.files(paste0(dir1, "/", dir2[1]))
+# file <- file[grep("IMG_", file)]
+# file <- gsub("[_]E", "_", file)
+# tb <- table(sapply(strsplit(file, "[_]|[.]"), function(x) x[2]))
+# # tb[tb!=1] # 0210
+# file[grep("0210", file)] # 123, 124, 975, 976
+
+pblapply(seq_along(dir2), function(i){
+  
+  # i <- 1
+  
+  # IMG_숫자로 된거만 쓰기
+  file <- list.files(paste0(dir1, "/", dir2[i]))
+  file <- file[grep("IMG_", file)]
+  
+  # IMG 뒤에 문자열 뽑아오기
+  char <- unlist(lapply(strsplit(file, "[_]|[.]"), function(x) x[2])) # E0145
+  
+  for( j in seq_along(char) ){ # seq_along(char)
+    # j <- 123
+    
+    # 해당 문자열을 제외한 문자열에 E가 포함이 되어있을 때만 진행(old/new를 삭제)
+    if ( paste0("E", char[j]) %in% char ){
+      
+      # E안붙은거(old) & E붙은거(new)
+      old <- file[j]
+      new <- file[grep(paste0("E", char[j]), file)]
+      
+      # 파일의 확장자명(extension)
+      old.ext <- unlist(lapply(strsplit(old, "[.]"), function(x) x[2]))
+      new.ext <- unlist(lapply(strsplit(new, "[.]"), function(x) x[2]))
+      
+      # E붙은게 여러개인 경우가 있음. 이에 따른 for문
+      for ( k in seq_along(new) ){
+        # k <- 1
+        
+        #---------------------------------------------------------------------------#
+        # 1. HEIC/JPG & JPG(E) 인 경우
+        #---------------------------------------------------------------------------#
+        if ( old.ext == "HEIC" | old.ext == "JPG" ){
+          
+          # old 삭제, 2번째부터는 old 또삭제하면 warning 뜸
+          if ( k == 1 ) file.remove(paste0(dir1, "/", dir2[i], "/", old))
+        
+          #---------------------------------------------------------------------------#
+          # 2. MOV & MOV/JPG,PNG,HEIC 인 경우
+          #    : new가 MOV가 아닌 이상 모두 old로 씀
+          #---------------------------------------------------------------------------#
+        } else if ( old.ext == "MOV" ){
+          
+          # 1. E붙은게 MOV면 old 삭제
+          if ( old.ext == "MOV" ){
+            # old 삭제, 2번째부터는 old 또삭제하면 warning 뜸
+            if ( k == 1 ) file.remove(paste0(dir1, "/", dir2[i], "/", old))
+
+            # 2. E붙은게 MOV가 아니면 나머지는 new 삭제
+          } else if ( old.ext %in% c("JPG", "PNG", "HEIC") ){
+            # new 삭제
+            file.remove(paste0(dir1, "/", dir2[i], "/", new)[k])
+
+            # 3. 이외의 케이스
+          } else stop("unknown error 1")
+          
+        }
+        
+        #---------------------------------------------------------------------------#
+        # 3. 이외의 케이스
+        #---------------------------------------------------------------------------#
+        else{
+          
+          cat(paste0(i, " ", j))
+          stop("unknown error 2")
+        }
+      }
+    }
+  }
+})
+  
+# 27개 많음
+lapply(paste0(dir1, "/", dir2), function(x) length(list.files(x))) %>% 
+  do.call(sum, .)
+
+#==============================================================================================================#
+# 3. E숫자 중에 JPG랑 MOV가 같이 존재하는 경우 삭제
+#
+# [1] "IMG_E0014.JPG" "IMG_E0014.MOV" "IMG_E0015.JPG" "IMG_E0015.MOV" "IMG_E0046.JPG"
+# [6] "IMG_E0046.MOV" "IMG_E0074.JPG" "IMG_E0074.MOV"
+# => E숫자.JPG, E숫자.MOV가 같이 존재하는경우 삭제
+#==============================================================================================================#
+lapply(seq_along(dir2), function(i){
+  
+  # i <- 1
+  file <- list.files(paste0(dir1, "/", dir2[i]))
+  path <- unlist(lapply(strsplit(file, "[_]|[.]"), function(x) x[2]))
+  
+  # 중복되는 개수를 보기위해 table
+  tb <- table(path)
+  
+  # 중복되는게 있는 경우
+  if ( length(tb[tb!=1]) != 0 ){
+    rm.name <- names(tb[tb!=1])
+    
+    # 중복되는 개수만큼에 대하여
+    for ( j in seq_along(rm.name) ){
+      # j <- 1
+      rm.name2 <- file[grep(names(tb[tb!=1])[j], file)]
+      rm.ext   <- unlist(lapply(strsplit(rm.name2, "[.]"), function(x) x[2])) # ext : 확장자
+      
+      # JPG & MOV 이면 JPG 삭제
+      if ( sum(rm.ext %in% c("JPG", "MOV")) == 2 ){
+        file.remove(paste0(dir1, "/", dir2[i], "/", rm.name2[grep("JPG", rm.name2)]))
+      }
+    }
+  }
+})
+
+# 789가 나와야함
+lapply(paste0(dir1, "/", dir2), function(x) length(list.files(x))) %>% 
+  do.call(sum, .)
+
+#==============================================================================================================#
+# 4. Face Time에서 캡쳐한 경우 MOV & HEIC가 같은 이름으로 존재
+#==============================================================================================================#
+lapply(seq_along(dir2), function(i){
+  # i <- 2
+  
+  file <- list.files(paste0(dir1, "/", dir2[i]))
+  
+  # 같은 이름으로 존재하는 것들을 scan
+  tb <- table(sapply(strsplit(file, "[.]"), function(f) f[1]))
+  if ( length(tb[tb!=1]) != 0 ){
+    name.x <- names(tb[tb!=1])
+    file.x <- file[grep(name.x, file)]
+    
+    # 같은 이름인게 MOV & HEIC이면 HEIC 삭제(MOV 선택)
+    ext.x <- sapply(strsplit(file.x, "[.]"), function(f) f[2])
+    if ( ((ext.x[1] == "HEIC") & (ext.x[2] == "MOV")) | ((ext.x[1] == "MOV") & (ext.x[2] == "HEIC")) ){
+      file.remove(paste0(dir1, "/", dir2[i], "/", file.x[grep("[.]HEIC", file.x)]))
+    }
+  }
+})
+
+# 789가 나와야함
+lapply(paste0(dir1, "/", dir2), function(x) length(list.files(x))) %>% 
+  do.call(sum, .)
+
+#==============================================================================================================#
+# 5. 구글포토(또는 다른 클라우드)를 통하여 사진을 다운로드하면 아이폰에서 다운하듯이,
+#    (필터가 없는 JPG + AAE + 필터들어간 JPG)로 3개가 다운받아지는데,
+#    문제점은.. IMG_숫자.JPG, IMG_숫자.AAE, IMG_E숫자.JPG로 다운받아지는게아니라 
+#    문자열숫자.JPG + 문자열숫자.AAE, 문자열E숫자.JPG로 다운받아지기때문에 위의 코드에서는 인식이 되지 않음.
+#==============================================================================================================#
+lapply(seq_along(dir2), function(i){
+  # i <- 1
+  
+  file <- list.files(paste0(dir1, "/", dir2[i]))
+  
+  for ( j in seq_along(file) ){
+    # j <- 649
+    
+    # IMG 붙은것들은 제외(위에서 했으므로)
+    if ( !grepl("IMG_", file[j]) ){
+      
+      # 문자를 쪼개서, 숫자가 들어가는 위치를 파악
+      file.x      <- unlist(strsplit(file[j], "[.]"))[1]
+      char        <- unlist(strsplit(file.x, ""))
+      char.to.num <- suppressWarnings(sapply(as.list(char), as.numeric))
+      
+      # 숫자가 들어가는 시작과 끝
+      which.num <- which(!is.na(char.to.num))
+      start.num <- which.num[1]
+      end.num   <- which.num[length(which.num)]
+      
+      # E안붙은거랑 E붙은거 문자열 만들기
+      origin.fig <- paste0(char, collapse = "")
+      filter.fig <- paste0(c(char[1:(start.num-1)], "E", char[start.num:length(char)]), collapse = "")
+      
+      # 둘다 포함되는 경우, 필터안된사진은 삭제
+      if ( (sum(grepl(origin.fig, file)) == 1) & (sum(grepl(filter.fig, file)) == 1) ){
+        file.remove(paste0(dir1, "/", dir2[i], "/", file[grep(origin.fig, file)]))
+      }
+    }
+  }
+})
+
+# 789가 나와야함
+lapply(paste0(dir1, "/", dir2), function(x) length(list.files(x))) %>% 
+  do.call(sum, .)
+
+#==============================================================================================================#
+# 6. 이름변경 : E붙은거 E없애기
+#==============================================================================================================#
+lapply(seq_along(dir2), function(i){
+  # i <- 1
+  
+  file <- list.files(paste0(dir1, "/", dir2[i]))
+  
+  # 문자에 E붙어있는것들 선택
+  sub  <- file[grep("_E", file)]
+  
+  for ( j in seq_along(sub) ){
+    # j <- 1
+    # E붙은거 없애기
+    file.rename(paste0(dir1, "/", dir2[i], "/", sub[j]),
+                gsub("_E", "_", paste0(dir1, "/", dir2[i], "/", sub[j])))
+  }
+})
+
+# 789가 나와야함
+lapply(paste0(dir1, "/", dir2), function(x) length(list.files(x))) %>% 
+  do.call(sum, .)
+
+# #==============================================================================================================#
+# # 7. 한파일로 합치기
+# #==============================================================================================================#
+# lapply(seq_along(dir2), function(i){
+#   # i <- 1
+# 
+#   file    <- list.files(paste0(dir1, "/", dir2[i]))
+# 
+#   # progress bar
+#   pb <- progress_bar$new(format = "  downloading [:bar] :percent eta: :eta",
+#                          total  = length(file),
+#                          clear  = FALSE,
+#                          width  = 60)
+# 
+#   for ( j in seq_along(file) ){
+#     # j <- 1
+# 
+#     # 이동한 메세지 가리기
+#     suppressMessages({
+#       # 파일이동
+#       file.move(paste0(dir1, "/", dir2[i], "/", file[j]),
+#                 dir1)
+#     })
+# 
+#     pb$tick()
+#   }
+# })
+# 
+# # 개수확인
+# length(list.files(dir1, "[.]"))
+# 
+# # 필요없는 폴더 삭제
+# dir.remove(paste0(dir1, "/", dir2))
+
+
+
+# 나중에 추가할거
+# #==============================================================================================================#
+# # 3. HEIC랑 JPG, PNG, MOV가 같이 있으면 삭제 (i)
+# #    1) HEIC, JPG -> 확인해보고 뭐가 좋은지 선택
+# #    2) HEIC, JPG, MOV -> MOV
+# #    3) 
+# #==============================================================================================================#
+# 
+# i<-1
+# 
+# p <- list.files(paste0(dir1, "/", dir2[i]))
+# tb <- lapply(strsplit(p, "[_]|[.]"), function(x) x[2]) %>% unlist %>% table
+# 
+# tb[tb!=1]
