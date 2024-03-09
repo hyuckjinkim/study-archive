@@ -1,3 +1,51 @@
+# Autogluon model checkpoints
+**/AutogluonModels/
+
+# virtual env
+.venv/
+
+# not used folder
+*.hwp
+*.gpkg
+**/._*
 .DS_Store
-/.ipynb_checkpoints/
+.ipynb_checkpoints/
 __pycache__/
+
+# kaggle data format
+*.so
+
+# modeling files
+*.t2v
+*.cbm
+*.pt
+*.tfevents
+*.model
+*.tmp
+*.h5
+*.pb
+*.index
+*.npy
+*.obs_
+
+# zip files
+*.zip
+*.tar
+
+# data files
+*.csv
+*.xlsx
+*.tsv
+*.parquet
+*.json
+*.pickle
+*.pkl
+*.joblib
+
+# image files
+*.png
+*.jpeg
+*.jpg
+
+# log files
+*.log
