@@ -19,6 +19,7 @@ __pycache__/
 *.t2v
 *.cbm
 *.pt
+*.pth
 *.tfevents
 *.model
 *.tmp
